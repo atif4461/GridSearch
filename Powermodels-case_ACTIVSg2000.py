@@ -124,6 +124,52 @@ def compare(opf_result,pf_result):
     mplt.close()
     #mplt.show()
 
+def postprocess_single_scenario(idx, opf_flag, lc_violations, load, n_loads, net):
+    hv_sum = 0
+    lv_sum = 0
+
+    # Precompute constants
+    n_buses = len(array_to_df(net.buses, 'bus'))
+    n_lines = len(array_to_df(net.branches, 'bran')[array_to_df(net.branches, 'bran').ratio == 0])
+
+    lv_max_pf = n_buses / 2.0
+    hv_max_pf = n_buses / 2.0
+    lv_max_opf = n_lines * n_buses / 2.0
+    hv_max_opf = n_lines * n_buses / 2.0
+
+    if opf_flag == 0:
+        old_violations = n_lines
+        hv_sum = hv_max_opf
+        lv_sum = lv_max_opf
+    else:
+        old_violations = len(lc_violations)
+
+        for entry in lc_violations:
+            if entry[1] == 'hv':
+                hv_sum += len(entry[2])
+            elif entry[1] == 'lv':
+                lv_sum += len(entry[2])
+            elif entry[0][1][0] == 'PF did not converged':
+                hv_sum = hv_max_pf
+                lv_sum = lv_max_pf
+
+    # Extract increment + bus from THIS scenario's load block
+    base_idx = idx * n_loads
+    increment = load.index[0].split('-')[4]
+    bus = load.index[0].split('-')[3]
+
+    df = pd.DataFrame({
+        'scenario': [idx],
+        'increment': [float(increment)],
+        'bus': [bus],
+        'number_of_hv_bus_violations': [float(hv_sum)],
+        'number_of_lv_bus_violations': [float(lv_sum)],
+        'old_violations': [float(old_violations)]
+    })
+
+    df.set_index('scenario', inplace=True)
+    return df
+
 def result_postprocessing(results):
     # postprocessing
     hv_bus_violations=[]; lv_bus_violations=[]; old_violations =[]; increment=[]; bus=[]
@@ -262,6 +308,15 @@ def line_contingency(net,vmax=1.05, vmin=0.95, line_loading_max=1.0, pb=False):
     else:
         return critical_lines
 
+def save_checkpoint(results, tag):
+    """Save current results as parquet checkpoint."""
+    if len(results['scenario']) == 0:
+        return
+    df = result_postprocessing(results)
+    path = os.path.join(output_dir, f"df_results_{start_index}_{end_index-1}_{tag}.parquet")
+    df.to_parquet(path)
+    print(f"\n  [checkpoint] Saved {len(results['scenario'])} scenarios to {path}")
+
 
 # ********************************************************************
 # **********************KEY INPUTS ***********************************
@@ -282,11 +337,12 @@ overwrite=True
 max_iteration=2000
 vmax=1.05
 vmin=0.95
+rows_per_scenario = 1125
 
 # Load network
 net = load_net_from_file(casefile)
-load = pd.read_csv(loadfile)
-load.set_index('Unnamed: 0', inplace=True)
+#load = pd.read_csv(loadfile)
+#load.set_index('Unnamed: 0', inplace=True)
 
 # Key parameters
 n_buses = net.buses.shape[0]
@@ -298,10 +354,8 @@ for i in range(n_buses):
         id_loads.append(i)
 n_loads =len(id_loads)
 
-id_sc=range(int(len(load)/n_loads))
-n_sc=len(id_sc)
+#id_sc=range(int(len(load)/n_loads))
 
-print(f"  Loaded {case_name}: {net.buses.shape[0]} buses, {net.gens.shape[0]} gens, {net.branches.shape[0]} branches, {n_loads} load buses, {int(len(load)/n_loads)} scenarios")
 
 # ------------------------------------------------------------------
 # Command-line arguments to split work across multiple jobs
@@ -326,17 +380,12 @@ start_index = args.start_index
 end_index = args.end_index
 save_every = args.save_every
 
+id_sc=list(range(start_index,end_index)) 
+n_sc=len(id_sc)
+print(f"  Loaded {case_name}: {net.buses.shape[0]} buses, {net.gens.shape[0]} gens, {net.branches.shape[0]} branches, {n_loads} load buses ")
+
 output_dir = "./Texas2k-Prof-Output"
 os.makedirs(output_dir, exist_ok=True)
-
-def save_checkpoint(results, tag):
-    """Save current results as parquet checkpoint."""
-    if len(results['scenario']) == 0:
-        return
-    df = result_postprocessing(results)
-    path = os.path.join(output_dir, f"df_results_{start_index}_{end_index-1}_{tag}.parquet")
-    df.to_parquet(path)
-    print(f"\n  [checkpoint] Saved {len(results['scenario'])} scenarios to {path}")
 
 # create a visualizaton html 
 bus_geodata = pd.read_csv(geofile,index_col=False)  # load geodata for visualization
@@ -352,35 +401,47 @@ if overwrite ==True:
         # Only process scenarios in the requested sub-range
         if idx < start_index or idx >= end_index:
             continue
+
+        print("line359", flush=True)
+        # Read only this scenario's rows
+        skip = range(1, idx * rows_per_scenario + 1)  # keep header row
+        load = pd.read_csv(loadfile, skiprows=skip, nrows=rows_per_scenario)
+        load.set_index('Unnamed: 0', inplace=True)
+
         #net = load_net_from_pglib(case_name)
         net = load_net_from_file(casefile)
         df_bus=array_to_df(net.buses,'bus')
 
-        df_bus.loc[df_bus.Pd !=0,"Pd"]=list(load.p_mw.iloc[idx*n_loads:(idx+1)*n_loads])
-        df_bus.loc[df_bus.Pd !=0,"Qd"]=list(load.q_mvar.iloc[idx*n_loads:(idx+1)*n_loads])
+        df_bus.loc[df_bus.Pd !=0,"Pd"]=list(load.p_mw)
+        df_bus.loc[df_bus.Pd !=0,"Qd"]=list(load.q_mvar)
 
+        print("line372", flush=True)
         # create array
         net.buses=df_to_array(df_bus,'bus')
+        print("line375", flush=True)
         # run OPF
         try:
             opf_result = run_opf(net, jl)
+            print("line379", flush=True)
             print(f" Scenario {idx}: {power_balance(opf_result,detail=False)}", end=" --- ")
             # set gen setpoints with OPF results
             net = pf_preprocessing(net, opf_result)
-            results['scenario'].append(idx)
-            results['opf'].append(1)
-            results['line_contingency_violations'].append(line_contingency(net,vmax=vmax, vmin=vmin))
+
+            lc = line_contingency(net, vmax=vmax, vmin=vmin)
+            df = postprocess_single_scenario(idx, 1, lc, load, n_loads, net)
+            print("line387", flush=True)
+
         except Exception as e:
             error_message = str(e)
             print(str(idx)+'  '+error_message, end=" --- ")
-            results['scenario'].append(idx)
-            results['opf'].append(0)
-            results['line_contingency_violations'].append('NA')
+            df = postprocess_single_scenario(idx, 0, [], load, n_loads, net)
 
         scenarios_since_save += 1
         if scenarios_since_save >= save_every:
             save_checkpoint(results, f"ckpt{len(results['scenario'])}")
             scenarios_since_save = 0
+        csv_path = os.path.join(output_dir, f"scenario_{idx}.csv")
+        df.to_csv(csv_path)
 
     # Save (skip if resultfile empty, e.g. when running chunked Slurm jobs)
     if resultfile:
@@ -395,10 +456,10 @@ elif overwrite==False:
         raise ValueError("overwrite is False but resultfile is empty; cannot load results.")
 t1 = time.time()
 print('\nTime duration', t1-t0)
-df_results=result_postprocessing(results)
-
-# Save final results as parquet
-parquet_path = os.path.join(output_dir, f"df_results_{start_index}_{end_index-1}.parquet")
-df_results.to_parquet(parquet_path)
-print(f"Saved df_results to {parquet_path}")
+#df_results=result_postprocessing(results)
+#
+## Save final results as parquet
+#parquet_path = os.path.join(output_dir, f"df_results_{start_index}_{end_index-1}.parquet")
+#df_results.to_parquet(parquet_path)
+#print(f"Saved df_results to {parquet_path}")
             
